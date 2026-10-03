@@ -15,13 +15,7 @@ class AgentContext:
 
 
 class AdvancedAgent:
-    """Student TODO: implement Agent B / Advanced Agent.
-
-    Required memory layers:
-    1. within-session memory
-    2. persistent `User.md`
-    3. compact memory for long threads
-    """
+    """Agent B with persistent profile facts and compact thread memory."""
 
     def __init__(self, config: LabConfig | None = None, force_offline: bool = False) -> None:
         self.config = config or load_config()
@@ -34,73 +28,131 @@ class AdvancedAgent:
         self.thread_tokens: dict[str, int] = {}
         self.thread_prompt_tokens: dict[str, int] = {}
 
-        # TODO: optionally initialize a real LangChain/LangGraph agent.
-        self.langchain_agent = None
+        self.langchain_agent = None if force_offline else self._maybe_build_langchain_agent()
 
     def reply(self, user_id: str, thread_id: str, message: str) -> dict[str, Any]:
-        """Student TODO: route between offline mode and live mode."""
+        """Route to deterministic offline mode or an optional live model."""
 
-        raise NotImplementedError
+        if self.langchain_agent is None:
+            return self._reply_offline(user_id, thread_id, message)
+
+        self._remember_profile_updates(user_id, message)
+        self.compact_memory.append(thread_id, "user", message)
+        prompt_tokens = self._estimate_prompt_context_tokens(user_id, thread_id)
+        profile = self.profile_store.read_text(user_id)
+        context = self.compact_memory.context(thread_id)
+        result = self.langchain_agent.invoke(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Bạn là trợ lý có bộ nhớ người dùng. Ưu tiên fact mới nhất, "
+                        "không suy diễn fact không có trong ngữ cảnh.\n\n"
+                        f"Hồ sơ người dùng:\n{profile}\n\n"
+                        f"Tóm tắt hội thoại cũ:\n{context['summary']}"
+                    ),
+                },
+                *context["messages"],
+            ]
+        )
+        response = self._result_text(result)
+        return self._record_response(thread_id, response, prompt_tokens)
 
     def token_usage(self, thread_id: str) -> int:
-        raise NotImplementedError
+        return self.thread_tokens.get(thread_id, 0)
 
     def prompt_token_usage(self, thread_id: str) -> int:
-        raise NotImplementedError
+        return self.thread_prompt_tokens.get(thread_id, 0)
 
     def memory_file_size(self, user_id: str) -> int:
-        raise NotImplementedError
+        return self.profile_store.file_size(user_id)
 
     def compaction_count(self, thread_id: str) -> int:
-        raise NotImplementedError
+        return self.compact_memory.compaction_count(thread_id)
 
     def _reply_offline(self, user_id: str, thread_id: str, message: str) -> dict[str, Any]:
-        """Student TODO: implement the deterministic advanced path.
+        """Persist stable facts and reply from profile plus compact context."""
 
-        Pseudocode:
-        1. Extract stable profile facts from the incoming message.
-        2. Persist those facts into `User.md`.
-        3. Append the message into compact memory.
-        4. Estimate prompt-context load from `User.md` + summary + recent messages.
-        5. Generate a response that can answer long-term recall questions.
-        6. Append the assistant reply and update token counters.
-        """
-
-        raise NotImplementedError
+        self._remember_profile_updates(user_id, message)
+        self.compact_memory.append(thread_id, "user", message)
+        prompt_tokens = self._estimate_prompt_context_tokens(user_id, thread_id)
+        response = self._offline_response(user_id, thread_id, message)
+        return self._record_response(thread_id, response, prompt_tokens)
 
     def _estimate_prompt_context_tokens(self, user_id: str, thread_id: str) -> int:
-        """Student TODO: estimate the context carried into one turn.
+        """Estimate profile, summary, and recent-message context for one turn."""
 
-        Hint:
-        - Include `User.md`
-        - Include compact summary text
-        - Include recent kept messages
-        """
-
-        raise NotImplementedError
+        context = self.compact_memory.context(thread_id)
+        parts = [self.profile_store.read_text(user_id), str(context["summary"])]
+        parts.extend(str(item.get("content", "")) for item in context["messages"])
+        return estimate_tokens("\n".join(parts))
 
     def _offline_response(self, user_id: str, thread_id: str, message: str) -> str:
-        """Student TODO: return a deterministic answer using persisted memory.
+        """Answer recall questions from the latest persisted facts."""
 
-        Make sure the advanced agent can answer questions like:
-        - "Mình tên gì?"
-        - "Hiện tại mình làm nghề gì?"
-        - "Nhắc lại style trả lời mình thích"
-        - questions in the long stress dataset
-        """
-
-        raise NotImplementedError
+        facts = self.profile_store.facts(user_id)
+        lowered = message.casefold()
+        requested = {
+            "name": any(term in lowered for term in ("tên", "là ai")),
+            "profession": any(term in lowered for term in ("nghề", "công việc", "product manager")),
+            "location": any(term in lowered for term in ("ở đâu", "nơi ở", "còn ở", "huế", "hà nội")),
+            "favorite_drink": "đồ uống" in lowered,
+            "favorite_food": "món ăn" in lowered,
+            "pet": any(term in lowered for term in ("nuôi con", "thú cưng", "corgi")),
+            "response_style": any(term in lowered for term in ("style", "kiểu trả lời", "cách trả lời")),
+            "interests": any(term in lowered for term in ("mối quan tâm", "quan tâm", "tóm tắt")),
+        }
+        labels = {
+            "name": "Tên",
+            "profession": "Nghề nghiệp hiện tại",
+            "location": "Nơi ở hiện tại",
+            "favorite_drink": "Đồ uống yêu thích",
+            "favorite_food": "Món ăn yêu thích",
+            "pet": "Thú cưng",
+            "response_style": "Kiểu trả lời",
+            "interests": "Mối quan tâm",
+        }
+        answers = [f"{labels[key]}: {facts[key]}" for key, wanted in requested.items() if wanted and key in facts]
+        if any(requested.values()):
+            return "; ".join(answers) + "." if answers else "Mình chưa có thông tin đó trong hồ sơ."
+        return "Mình đã cập nhật các thông tin ổn định vào hồ sơ."
 
     def _maybe_build_langchain_agent(self):
-        """Student TODO: wire a live agent with tools and compact middleware.
+        """Build an optional live model; memory is supplied explicitly per turn."""
 
-        High-level design:
-        - `build_chat_model(self.config.model)` for the selected provider
-        - `InMemorySaver` for short-term thread state
-        - tool to read `User.md`
-        - tool to write/edit `User.md`
-        - dynamic prompt that injects profile memory
-        - summarization middleware for long threads
-        """
+        try:
+            return build_chat_model(self.config.model)
+        except (ImportError, ValueError):
+            return None
 
-        raise NotImplementedError
+    def _remember_profile_updates(self, user_id: str, message: str) -> None:
+        existing = self.profile_store.facts(user_id)
+        for key, value in extract_profile_updates(message).items():
+            if key == "response_style" and key in existing:
+                parts = [part.strip() for part in f"{existing[key]}, {value}".split(",")]
+                value = ", ".join(dict.fromkeys(part for part in parts if part))
+            self.profile_store.upsert_fact(user_id, key, value)
+            existing[key] = value
+
+    def _record_response(self, thread_id: str, response: str, prompt_tokens: int) -> dict[str, Any]:
+        response_tokens = estimate_tokens(response)
+        self.thread_prompt_tokens[thread_id] = self.prompt_token_usage(thread_id) + prompt_tokens
+        self.thread_tokens[thread_id] = self.token_usage(thread_id) + response_tokens
+        self.compact_memory.append(thread_id, "assistant", response)
+        return {
+            "response": response,
+            "tokens": response_tokens,
+            "prompt_tokens": prompt_tokens,
+        }
+
+    @staticmethod
+    def _result_text(result: Any) -> str:
+        messages = result.get("messages", []) if isinstance(result, dict) else []
+        last = messages[-1] if messages else result
+        content = last.get("content", "") if isinstance(last, dict) else getattr(last, "content", last)
+        if isinstance(content, list):
+            return "".join(
+                str(part.get("text", "")) if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        return str(content)
